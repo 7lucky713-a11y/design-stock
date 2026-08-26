@@ -24,6 +24,8 @@ export async function POST(request: Request) {
     const expires = Date.now() + 10 * 60 * 1000;
     const payload = `${key}:${contentType}:${expires}`;
     const sig = sign(payload);
+
+    // Keep the upload same-origin so browser CORS never touches R2 directly.
     const uploadUrl = `/api/uploads/put?key=${encodeURIComponent(key)}&contentType=${encodeURIComponent(contentType)}&expires=${expires}&sig=${sig}`;
 
     return NextResponse.json({ uploadUrl, key, publicUrl: r2PublicUrl(key) });
