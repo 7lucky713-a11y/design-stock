@@ -20,7 +20,6 @@ const DAILY_UPLOAD_LIMIT = 20;
 const STALE_UPLOAD_MS = 24 * 60 * 60 * 1000;
 const CHUNK_BYTES = 2_500_000;
 const MAX_PARTS = 5;
-const MAX_OWNER_CAMPAIGNS_FOR_CLEANUP = 200;
 
 const TYPE_INFO: Record<string, { max: number; ext: string }> = {
   'image/jpeg': { max: IMAGE_MAX, ext: 'jpg' },
@@ -95,12 +94,20 @@ function tempKey(campaignId: string, uploadId: string, part: number) {
   return `harfway-ads/tmp/${campaignId}/${uploadId}/${part}.part`;
 }
 
+function tempPrefix(campaignId: string, uploadId: string) {
+  return `harfway-ads/tmp/${campaignId}/${uploadId}/`;
+}
+
 function ownerHash(ownerUserId: string) {
   return createHash('sha256').update(ownerUserId).digest('hex').slice(0, 32);
 }
 
+function openReservationPrefix(ownerUserId: string) {
+  return `harfway-ads/guard/${ownerHash(ownerUserId)}/open/`;
+}
+
 function openReservationKey(ownerUserId: string, uploadId: string) {
-  return `harfway-ads/guard/${ownerHash(ownerUserId)}/open/${uploadId}.json`;
+  return `${openReservationPrefix(ownerUserId)}${uploadId}.json`;
 }
 
 function dailyReservationPrefix(ownerUserId: string, date = new Date().toISOString().slice(0, 10)) {
@@ -186,9 +193,9 @@ async function updateCampaignMedia(
   if (!Array.isArray(rows) || rows.length !== 1) throw new Error('Campaign media update was not applied');
 }
 
-async function readReservation(client: ReturnType<typeof r2>, bucket: string, ownerUserId: string, uploadId: string) {
+async function readReservationByKey(client: ReturnType<typeof r2>, bucket: string, key: string) {
   try {
-    const obj = await client.send(new GetObjectCommand({ Bucket: bucket, Key: openReservationKey(ownerUserId, uploadId) }));
+    const obj = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     if (!obj.Body) return null;
     const text = await obj.Body.transformToString();
     const value = JSON.parse(text || '{}');
@@ -197,6 +204,10 @@ async function readReservation(client: ReturnType<typeof r2>, bucket: string, ow
   } catch {
     return null;
   }
+}
+
+async function readReservation(client: ReturnType<typeof r2>, bucket: string, ownerUserId: string, uploadId: string) {
+  return readReservationByKey(client, bucket, openReservationKey(ownerUserId, uploadId));
 }
 
 async function createReservation(
@@ -249,36 +260,50 @@ async function deleteKeys(client: ReturnType<typeof r2>, bucket: string, keys: s
   return deleted;
 }
 
-async function cleanupStaleUploads(
-  client: ReturnType<typeof r2>,
-  bucket: string,
-  ownerUserId: string,
-  ownerCampaigns: CampaignRow[]
-) {
-  const cutoff = Date.now() - STALE_UPLOAD_MS;
-  const stale: string[] = [];
+function uploadIdFromReservationKey(key: string) {
+  const file = key.split('/').pop() || '';
+  return cleanUploadId(file.replace(/\.json$/, ''));
+}
 
+async function cleanupStaleUploads(client: ReturnType<typeof r2>, bucket: string, ownerUserId: string) {
+  const cutoff = Date.now() - STALE_UPLOAD_MS;
   const open = await client.send(new ListObjectsV2Command({
     Bucket: bucket,
-    Prefix: `harfway-ads/guard/${ownerHash(ownerUserId)}/open/`,
-    MaxKeys: 1000
+    Prefix: openReservationPrefix(ownerUserId),
+    MaxKeys: DAILY_UPLOAD_LIMIT * 3
+  }));
+
+  const staleKeys: string[] = [];
+  for (const item of open.Contents || []) {
+    if (!item.Key || !item.LastModified || item.LastModified.getTime() >= cutoff) continue;
+    const uploadId = uploadIdFromReservationKey(item.Key);
+    const reservation = uploadId ? await readReservationByKey(client, bucket, item.Key) : null;
+    if (uploadId && reservation?.campaignId) {
+      const parts = await client.send(new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: tempPrefix(reservation.campaignId, uploadId),
+        MaxKeys: MAX_PARTS
+      }));
+      for (const part of parts.Contents || []) if (part.Key) staleKeys.push(part.Key);
+    }
+    staleKeys.push(item.Key);
+  }
+
+  return deleteKeys(client, bucket, staleKeys);
+}
+
+async function hasOpenReservationForCampaign(client: ReturnType<typeof r2>, bucket: string, ownerUserId: string, campaignId: string) {
+  const open = await client.send(new ListObjectsV2Command({
+    Bucket: bucket,
+    Prefix: openReservationPrefix(ownerUserId),
+    MaxKeys: DAILY_UPLOAD_LIMIT * 2
   }));
   for (const item of open.Contents || []) {
-    if (item.Key && item.LastModified && item.LastModified.getTime() < cutoff) stale.push(item.Key);
+    if (!item.Key) continue;
+    const reservation = await readReservationByKey(client, bucket, item.Key);
+    if (reservation?.campaignId === campaignId && reservationMatches(reservation, campaignId, reservation.contentType)) return true;
   }
-
-  for (const campaign of ownerCampaigns.slice(0, MAX_OWNER_CAMPAIGNS_FOR_CLEANUP)) {
-    const listed = await client.send(new ListObjectsV2Command({
-      Bucket: bucket,
-      Prefix: `harfway-ads/tmp/${campaign.id}/`,
-      MaxKeys: 1000
-    }));
-    for (const item of listed.Contents || []) {
-      if (item.Key && item.LastModified && item.LastModified.getTime() < cutoff) stale.push(item.Key);
-    }
-  }
-
-  return deleteKeys(client, bucket, stale);
+  return false;
 }
 
 async function removeReservation(client: ReturnType<typeof r2>, bucket: string, ownerUserId: string, uploadId: string) {
@@ -306,6 +331,7 @@ export async function GET(request: Request) {
       dailyUploadStarts: DAILY_UPLOAD_LIMIT,
       staleUploadHours: STALE_UPLOAD_MS / 3600000,
       oneCurrentAssetPerCampaign: true,
+      oneOpenUploadPerCampaign: true,
       replacementDeletesPreviousR2Object: true,
       putRequiresServerReservation: true
     }
@@ -360,10 +386,17 @@ export async function POST(request: Request) {
       }
 
       const client = r2();
-      const cleanedStaleObjects = await cleanupStaleUploads(client, bucket, campaign.owner_user_id, ownerCampaigns).catch((error) => {
+      const cleanedStaleObjects = await cleanupStaleUploads(client, bucket, campaign.owner_user_id).catch((error) => {
         console.warn('ADS stale upload cleanup skipped', error);
         return 0;
       });
+      if (await hasOpenReservationForCampaign(client, bucket, campaign.owner_user_id, campaignId)) {
+        return json(request, {
+          error: 'この案件では別の素材アップロードが進行中です。完了するか、24時間後に再度お試しください。',
+          code: 'UPLOAD_ALREADY_OPEN'
+        }, 409);
+      }
+
       const dailyStarts = await countDailyReservations(client, bucket, campaign.owner_user_id);
       if (dailyStarts >= DAILY_UPLOAD_LIMIT) {
         return json(request, {
